@@ -1,4 +1,4 @@
-name: CI — verify and publish image
+name: CI — verify, publish image and deploy
 
 on:
   push:
@@ -128,3 +128,50 @@ jobs:
         run: |
           docker push "${IMAGE_NAME}:${GITHUB_SHA}"
           docker push "${IMAGE_NAME}:latest"
+
+  deploy:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, devops-vm]
+
+    permissions:
+      contents: read
+
+    concurrency:
+      group: deploy-devops-vm
+      cancel-in-progress: false
+
+    env:
+      VM_HOST: 192.168.56.102
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Deploy with Ansible
+        working-directory: ansible
+        run: |
+          set -euo pipefail
+          ansible-playbook site.yml -e "app_tag=${GITHUB_SHA}"
+
+      - name: Check through Nginx
+        run: |
+          set -euo pipefail
+          ready=0
+          for attempt in $(seq 1 10); do
+            if curl --fail --silent --show-error --max-time 5 \
+              "http://${VM_HOST}/health" --output health.json; then
+              ready=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::/health did not respond through Nginx"
+            exit 1
+          fi
+          cat health.json
+          python3 -c 'import json,sys; p=json.load(open("health.json")); assert p == {"status": "ok"}, p; print("health ok")'
+          curl --fail --silent --show-error "http://${VM_HOST}/"
